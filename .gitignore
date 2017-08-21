@@ -8,3 +8,4 @@ build/
 .coverage
 .ort
 .cache
+.vscode
