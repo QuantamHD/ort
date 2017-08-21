@@ -4,6 +4,8 @@ import shutil
 import json
 import uuid
 import stat
+from subprocess import check_call
+from data.database import Database
 
 
 @click.group()
@@ -22,16 +24,84 @@ def main():
 
 @main.command()
 def init():
+    """Initializes ort in the root of a git project."""
     init_impl()
 
+@main.command()
+@click.option('--ref', is_flag=True)
+@click.argument('name')
+def snapshot(ref, name):
+    """makes a snapshot"""
+    directory = get_ort_directory()
+    database = get_database_from_config(directory)
+    
+    if ref:
+        command = database.snapshot_command(os.path.join(directory, '.ort', 'ref_snapshots', name))
+    else:
+        command = database.snapshot_command(os.path.join(directory, '.ort', 'named_snapshots', name))
+    click.echo('Taking a snapshot of the database')
+    try:
+        check_call(command, shell=True)
+    except CalledProcessError:
+        click.echo('Snapshot complete.')
+        raise click.UsageError("There was an error trying to make a snapshot")
+    
+    click.echo('Snapshot Complete.')
+
+@main.command()
+@click.option('--ref', is_flag=True)
+@click.argument('name')
+def restore(ref, name):
+    directory = get_ort_directory()
+    database = get_database_from_config(directory)
+    click.echo("Starting restore of database snapshot {}".format(name))
+    if ref:
+        snapshot = os.path.join(directory, '.ort', 'ref_snapshots', name)
+        if os.path.isfile(snapshot):
+            command = check_call(database.restore_command(snapshot), shell=True)
+        else:
+            raise click.UsageError("Could not find snap shot named {}".format(name))
+    else:
+        snapshot = os.path.join(directory, '.ort', 'named_snapshots', name)
+        if os.path.isfile(snapshot):
+            check_call(database.restore_command(snapshot), shell=True)
+        else:
+            raise click.UsageError("Could not find snap shot named {}".format(name))
+    click.echo("Restored database snapshot {}".format(name))
+
+    
+def get_database_from_config(ort_parent_directory):
+    config_file = os.path.join(ort_parent_directory, ".ort", "config")
+    with open(config_file, 'r') as content_file:
+        content = content_file.read()
+    
+    config_map = json.loads(content)
+    return Database.build_from(config_map["database"])
+
+def get_ort_directory():
+    directory = walk_up_looking_for('.ort')
+    if not directory:
+        raise click.UsageError("There is no initialized ort project here.")
+
+    return directory
+
+def walk_up_looking_for(directory):
+    current_directory = os.getcwd()
+    while current_directory != os.path.dirname(current_directory):
+        if os.path.isdir(os.path.join(current_directory, directory)):
+            return current_directory
+        current_directory = os.path.dirname(current_directory)
+
+    return None
 
 def init_impl():
-    """Initializes ort in the root of a git project."""
     if not os.path.isdir('.git'):
         raise click.UsageError("You must initiate ort in the root folder of a git project.")
     
     if not os.path.isdir('.ort'):
         os.makedirs('.ort')
+        os.makedirs('.ort/ref_snapshots')
+        os.makedirs('.ort/named_snapshots')
     else:
         raise click.UsageError("ort is alread initialized, if this command ended in an error please remove the .ort folder. and run the command again.")
     click.echo("Created .ort configuration folder.")
@@ -70,35 +140,41 @@ def init_scripts():
     post_merge_exists    = os.path.isfile('.git/hooks/post-merge')
     post_checkout_exists = os.path.isfile('.git/hooks/post-checkout')
 
-    post_commit_script   = """
-    echo $GIT_DIR
-    """
-    
-    post_merge_script    = """
-    echo $GIT_DIR
+    modify_script = """
+    ref=\"$(git rev-parse HEAD)\"
+    ort snapshot --ref $ref
     """
 
-    post_checkout_exists = """
-    echo $GIT_DIR
+    post_commit_script   = modify_script
+    post_merge_script    = modify_script
+
+    post_checkout_script = """
+    oldRef=$(echo $1 | sed 's/,*$//g')
+    newRef=$(echo $2 | sed 's/,*$//g')
+
+    ort snapshot --ref $oldRef
+    ort restore --ref $newRef
     """
 
-    create_script(post_checkout_exists, '.git/hooks/post-checkout', post_checkout_exists, "$1, $2, $3")
+    create_script(post_commit_script  , './.git/hooks/post-commit'  , post_commit_exists, "")
+    create_script(post_merge_script   , './.git/hooks/post-merge'   , post_merge_exists, "$1")
+    create_script(post_checkout_script, './.git/hooks/post-checkout', post_checkout_exists, "$1, $2, $3")
 
 
 def create_script(script, script_path, script_exists, params):
     filename = os.path.basename(os.path.normpath(script_path))
-    if script_exists and not os.path.isfile(script_path + ".ort"):
+    if script_exists and (not os.path.isfile(script_path + ".ort")):
         shutil.move(script_path, script_path + ".userscript")
         
         ort_script = open(script_path + ".ort", "a")
-        click.echo(message = "#!/bin/sh", file = ort_script)
-        click.echo(message = script, file = ort_script)
+        click.echo(message="#!/bin/sh", file=ort_script)
+        click.echo(message=script, file=ort_script)
         ort_script.close()
 
-        main_script_content = "./hooks/{}.userscript {} && ./hooks/{}.ort {}".format(filename, params, filename, params)
+        main_script_content = "$GIT_DIR/hooks/{}.userscript {} && $GIT_DIR/hooks/{}.ort {}".format(filename, params, filename, params)
         main_script = open(script_path, "a")
-        click.echo(message = "#!/bin/sh", file = main_script)
-        click.echo(message = main_script_content, file = main_script)
+        click.echo(message="#!/bin/sh", file=main_script)
+        click.echo(message=main_script_content, file=main_script)
         main_script.close()
 
         make_file_executable(script_path)
@@ -106,17 +182,17 @@ def create_script(script, script_path, script_exists, params):
         make_file_executable(script_path + ".userscript")
 
     elif script_exists and os.path.isfile(script_path + ".ort"):
-        raise click.UsageError("The required ort scripts already exist, post_commit, post_merge, post_rebase, and post_checkout")
+        raise click.UsageError("Ort scripts already exist, post_commit, post_merge, post_rebase, and post_checkout")
     else:
         ort_script = open(script_path + ".ort", "a")
-        click.echo(message = "#!/bin/sh", file = ort_script)
-        click.echo(message = script, file = ort_script)
+        click.echo(message="#!/bin/sh", file=ort_script)
+        click.echo(message=script, file=ort_script)
         ort_script.close()
 
-        main_script = "./hooks/{}.ort {}".format(filename, params)
+        main_script = "$GIT_DIR/hooks/{}.ort {}".format(filename, params)
         file = open(script_path, "a")
-        click.echo(message = "#!/bin/sh", file = file)
-        click.echo(message = main_script, file = file)
+        click.echo(message="#!/bin/sh", file=file)
+        click.echo(message=main_script, file=file)
         file.close()
 
         make_file_executable(script_path)
